@@ -1,0 +1,396 @@
+#include <FastLED.h>
+#include <Keyboard.h>
+
+#define LED_PIN 9       // Data pin for WS2812B
+#define NUM_LEDS 9      // Total number of LEDs
+#define BRIGHTNESS 200  // Maximum brightness (0-255)
+#define MIN_BREATH_LEVEL 20 // Minimum brightness for breathing effect
+
+// --- Reusable Color Palette ---
+const CRGB colorPalette[] = {
+  CRGB(125, 31, 0),   // Your Color 1
+  CRGB(132, 0, 24),   // Your Color 2
+  CRGB(0, 122, 34),   // Your Color 3
+  //CRGB::Blue,
+  //CRGB::OrangeRed,
+  //CRGB::DeepPink,
+  //CRGB::Green,
+  //CRGB::Yellow
+};
+const int paletteSize = sizeof(colorPalette) / sizeof(colorPalette[0]);
+
+
+// --- Animation Settings ---
+#define BREATHING_SPEED 10      // Lower value = faster breathing
+#define CIRCLE_DELAY_TIME 20    // Delay for the single circle animation step (ms)
+const CRGB CIRCLE_COLOR = CRGB(203,0,123);//::Aqua; // Color for the circle animation
+
+// Center Burst parameters
+const unsigned long BURST_STEP_INTERVAL = 75; // ms delay between expansion steps
+const unsigned long BURST_FADE_INTERVAL = 42;//30 // ms delay between fade steps
+const unsigned long BURST_FADE_DURATION = 2000;//500 // ms total fade duration per cycle
+const uint8_t BURST_FADE_AMT = 12;//40    // How much to fade each fade step
+
+// Color Wipe parameters
+const unsigned long WIPE_STEP_INTERVAL = 100; // ms delay between wipe steps
+
+// Confetti parameters
+#define CONFETTI_FADE_RATE 20      // How quickly sparkles fade (higher = faster fade)
+#define CONFETTI_SPARKLE_PROBABILITY 40 // Chance (out of 256) of a new sparkle per frame
+#define CONFETTI_DELAY 15          // Delay between confetti updates (ms)
+
+CRGB leds[NUM_LEDS];
+
+// --- Pins ---
+const int buttonBIG = 6;    // Triggers singleCircle (always)
+const int buttonSMALL = 3;  // Switches between idle modes
+
+// --- Button State Tracking ---
+bool lastStateButtonBIG = HIGH;
+bool lastStateButtonSMALL = HIGH;
+
+// --- Global State ---
+CRGB currentBreathColor; // Holds the selected color for the breathing effect
+
+// Mode switching state
+enum Mode { MODE_BREATHING, MODE_BURST, MODE_WIPE, MODE_CONFETTI };
+Mode currentMode = MODE_BREATHING; // Start in Breathing mode
+
+// Globals for continuous burst animation state
+enum BurstState { BURST_EXPANDING, BURST_FADING };
+BurstState burstState = BURST_EXPANDING;
+int burst_k = 0;
+CRGB burst_currentColor;
+unsigned long burst_lastUpdateTime = 0;
+unsigned long burst_fadeStartTime = 0;
+
+// Globals for continuous wipe animation state
+enum WipeState { WIPE_FILLING, WIPE_UNFILLING };
+WipeState wipeState = WIPE_FILLING;
+int wipe_currentIndex = 0;
+CRGB wipe_currentColor;
+unsigned long wipe_lastUpdateTime = 0;
+
+
+// --- Function Prototypes ---
+void breathingEffect(CRGB baseColor);
+void singleCircle(CRGB color, int wait, int spins);
+void setupCenterBurst();
+void updateCenterBurst();
+void setupColorWipe();
+void updateColorWipe();
+void printRGB(CRGB color);
+
+
+// ========================
+// ===      SETUP       ===
+// ========================
+void setup() {
+  pinMode(buttonBIG, INPUT_PULLUP);
+  pinMode(buttonSMALL, INPUT_PULLUP);
+  Keyboard.begin();
+
+  Serial.begin(9600);
+  //while (!Serial);
+  Serial.println("LED Animation Switcher Ready (3 Modes).");
+  Serial.print("Palette size: "); Serial.println(paletteSize);
+  Serial.println("Current Mode: Breathing");
+
+  randomSeed(analogRead(A0));
+
+  // Select Initial Random Breathing Color
+  if (paletteSize > 0) {
+    currentBreathColor = colorPalette[random(paletteSize)];
+    Serial.print("Initial breath color: "); printRGB(currentBreathColor); Serial.println();
+  } else {
+    Serial.println("WARNING: Color Palette is empty!");
+    currentBreathColor = CRGB::Black;
+  }
+
+  // Initialize states for ALL modes at startup
+  setupCenterBurst();
+  setupColorWipe();
+  setupConfetti();
+
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+  delay(100);
+} // End Setup
+
+
+// ========================
+// ===   MAIN LOOP      ===
+// ========================
+void loop() {
+  // --- Read Buttons ---
+  bool buttonStateBIG = digitalRead(buttonBIG);
+  bool buttonStateSMALL = digitalRead(buttonSMALL);
+  bool bigButtonJustPressed = (buttonStateBIG == LOW && lastStateButtonBIG == HIGH);
+  bool smallButtonJustPressed = (buttonStateSMALL == LOW && lastStateButtonSMALL == HIGH);
+
+  // --- Handle BIG Button Press (Always Active - Triggers Single Circle) ---
+  if (bigButtonJustPressed) {
+    Keyboard.press(' ');
+    Serial.println("BIG Button: Triggering Single Circle");
+    singleCircle(CIRCLE_COLOR, CIRCLE_DELAY_TIME, 10); // Run circle animation (BLOCKING)
+
+    // After circle, always pick a new random color for the potential breathing effect state
+    if (paletteSize > 0) {
+      currentBreathColor = colorPalette[random(paletteSize)];
+      Serial.print("Set new potential breath color: "); printRGB(currentBreathColor); Serial.println();
+    }
+    // Ensure display is cleared before resuming the current idle animation
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+    delay(50); // Pause briefly after circle finishes
+  }
+
+  // Handle BIG Button Release (Always Active)
+  if (buttonStateBIG == HIGH && lastStateButtonBIG == LOW) {
+    Keyboard.release(' ');
+    delay(10);
+  }
+
+  // --- Mode Switching Logic (SMALL Button - Cycles through 3 modes) ---
+  if (smallButtonJustPressed) {
+    fill_solid(leds, NUM_LEDS, CRGB::Black); // Clear LEDs on mode switch
+    FastLED.show();
+    delay(50); // Short pause for visual break
+
+    if (currentMode == MODE_BREATHING) {
+      currentMode = MODE_BURST;
+      Serial.println("Switched to Mode: Burst");
+      setupCenterBurst(); // Initialize burst state
+    } else if (currentMode == MODE_BURST) {
+      currentMode = MODE_WIPE;
+      Serial.println("Switched to Mode: Wipe");
+      setupColorWipe(); // Initialize wipe state
+    } else if (currentMode == MODE_WIPE){ // Was MODE_WIPE
+      currentMode = MODE_CONFETTI;
+      Serial.println("Switched to Mode: Confetti");
+      // Breathing doesn't need a specific setup call here, uses currentBreathColor
+    } else if (currentMode == MODE_CONFETTI){ // Was MODE_CONFETTI          // <<-- ADDED THIS ELSE BLOCK
+      currentMode = MODE_BREATHING;       // Cycle back to Breathing
+      Serial.println("Switched to Mode: Breathing");
+      // Breathing doesn't need a specific setup call here
+    }
+     delay(50); // Debounce small button
+  } // End Mode Switch
+
+
+  // --- Execute Current Mode's Continuous Animation ---
+  // Runs after singleCircle completes if it was triggered, or continuously otherwise.
+  if (currentMode == MODE_BREATHING) {
+    if (paletteSize > 0) {
+      breathingEffect(currentBreathColor);
+    } else {
+      fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
+    }
+  } else if (currentMode == MODE_BURST) {
+    updateCenterBurst(); // Non-blocking burst update
+  } else  if (currentMode == MODE_WIPE) {
+    updateColorWipe();
+  } else if (currentMode == MODE_CONFETTI) { // currentMode == MODE_CONFETTI  // <<-- ADDED THIS ELSE BLOCK
+    updateConfetti();   // Call confetti update function
+  } // End Mode Execution Check
+
+  // --- Update Button Last States ---
+  lastStateButtonBIG = buttonStateBIG;
+  lastStateButtonSMALL = buttonStateSMALL;
+
+} // End Loop
+
+
+// =============================
+// === SETUP/UPDATE FUNCTIONS ===
+// =============================
+
+/* Initializes/Resets state variables for Center Burst */
+void setupCenterBurst() {
+    if (paletteSize > 0) {
+        burst_currentColor = colorPalette[random(paletteSize)];
+        // Serial.print("Init Burst Color: "); printRGB(burst_currentColor); Serial.println(); // Debug
+    } else {
+        burst_currentColor = CRGB::Black;
+    }
+    burstState = BURST_EXPANDING;
+    burst_k = 0;
+    burst_lastUpdateTime = millis();
+}
+
+/* Non-Blocking Update function for Center Burst Fade Animation */
+void updateCenterBurst() {
+    if (paletteSize <= 0 || NUM_LEDS == 0) return;
+    unsigned long now = millis();
+
+    if (burstState == BURST_EXPANDING) {
+        if (now - burst_lastUpdateTime >= BURST_STEP_INTERVAL) {
+            burst_lastUpdateTime = now;
+            int center = NUM_LEDS / 2;
+            int index1 = center - burst_k;
+            int index2 = center + burst_k;
+            if (index1 >= 0) leds[index1] = burst_currentColor;
+            if (index2 < NUM_LEDS && index1 != index2) leds[index2] = burst_currentColor;
+            FastLED.show();
+            burst_k++;
+            if (burst_k > center) {
+                burstState = BURST_FADING;
+                burst_fadeStartTime = now;
+            }
+        }
+    } else { // BURST_FADING
+        if (now - burst_lastUpdateTime >= BURST_FADE_INTERVAL) {
+             burst_lastUpdateTime = now;
+             fadeToBlackBy(leds, NUM_LEDS, BURST_FADE_AMT);
+             FastLED.show();
+        }
+        if (now - burst_fadeStartTime >= BURST_FADE_DURATION) {
+             burstState = BURST_EXPANDING;
+             burst_k = 0;
+             burst_currentColor = colorPalette[random(paletteSize)]; // New color
+             // Serial.print("Burst New Cycle Color: "); printRGB(burst_currentColor); Serial.println(); // Debug
+        }
+    }
+} // End updateCenterBurst
+
+
+/* Initializes/Resets state variables for Color Wipe */
+void setupColorWipe() {
+     if (paletteSize > 0) {
+        wipe_currentColor = colorPalette[random(paletteSize)];
+        // Serial.print("Init Wipe Color: "); printRGB(wipe_currentColor); Serial.println(); // Debug
+    } else {
+        wipe_currentColor = CRGB::Black;
+    }
+    wipeState = WIPE_FILLING;
+    wipe_currentIndex = 0; // Start filling from index 0
+    wipe_lastUpdateTime = millis();
+    fill_solid(leds, NUM_LEDS, CRGB::Black); // Ensure clean start
+    FastLED.show();
+}
+
+/* Non-Blocking Update function for Color Wipe Animation */
+void updateColorWipe() {
+    if (paletteSize <= 0 || NUM_LEDS == 0) return;
+    unsigned long now = millis();
+
+    if (now - wipe_lastUpdateTime >= WIPE_STEP_INTERVAL) {
+        wipe_lastUpdateTime = now;
+
+        if (wipeState == WIPE_FILLING) {
+            // Set the current LED to the wipe color
+            if (wipe_currentIndex < NUM_LEDS) {
+                leds[wipe_currentIndex] = wipe_currentColor;
+                FastLED.show();
+                wipe_currentIndex++; // Move to next index for next time
+
+                // Check if fill is complete
+                if (wipe_currentIndex >= NUM_LEDS) {
+                    wipeState = WIPE_UNFILLING;
+                    wipe_currentIndex = NUM_LEDS - 1; // Prepare index for unfilling
+                    // Serial.println("Wipe Filling Complete -> Unfilling"); // Debug
+                    // Optional: Pause briefly when full before unfilling
+                     wipe_lastUpdateTime += WIPE_STEP_INTERVAL * 2; // Skip next 2 updates for a pause
+                }
+            }
+        } else { // WIPE_UNFILLING
+            // Set the current LED to black
+            if (wipe_currentIndex >= 0) {
+                leds[wipe_currentIndex] = CRGB::Black;
+                FastLED.show();
+                wipe_currentIndex--; // Move to next index for next time
+
+                // Check if unfill is complete
+                if (wipe_currentIndex < 0) {
+                    wipeState = WIPE_FILLING;
+                    wipe_currentIndex = 0; // Prepare index for filling again
+                    // Pick NEW random color for the next cycle
+                    wipe_currentColor = colorPalette[random(paletteSize)];
+                    // Serial.print("Wipe Unfilling Complete -> New Cycle. Color: "); printRGB(wipe_currentColor); Serial.println(); // Debug
+                    // Optional: Pause briefly when empty before refilling
+                    wipe_lastUpdateTime += WIPE_STEP_INTERVAL * 4; // Skip next 4 updates for a pause
+                }
+            }
+        }
+    }
+} // End updateColorWipe
+
+
+// =============================
+// ===   OTHER FUNCTIONS     ===
+// =============================
+
+/* Applies a breathing effect to the provided baseColor */
+void breathingEffect(CRGB baseColor) {
+  float breath = (exp(sin(millis() / (1000.0 * PI / BREATHING_SPEED))) - 0.36787944) * 108.0;
+  uint8_t breathValue = map(constrain(breath, 0, 255), 0, 255, MIN_BREATH_LEVEL, BRIGHTNESS);
+  fill_solid(leds, NUM_LEDS, baseColor.scale8(breathValue));
+  FastLED.show();
+}
+
+/* Runs a single LED circle animation multiple times. (BLOCKING) */
+void singleCircle(CRGB color, int wait, int spins) {
+  if (spins <= 0 || NUM_LEDS == 0) return;
+  for (int j = 0; j < spins; j++) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      leds[i] = color;
+      FastLED.show();
+      delay(wait); // BLOCKING delay
+    }
+  }
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+}
+
+/*
+ * Initializes/Resets state variables for Confetti effect.
+ * Ensures LEDs start black for this effect.
+ */
+void setupConfetti() {
+    // Serial.println("Init Confetti"); // Debug message if needed
+    fill_solid(leds, NUM_LEDS, CRGB::Black); // Start clean
+    FastLED.show();
+}
+
+/*
+ * Non-Blocking Update function for Confetti/Sparkle Animation.
+ * Call this repeatedly from the main loop when Confetti mode is active.
+ */
+void updateConfetti() {
+    // Step 1: Fade all existing LEDs down slightly to create trails
+    // Higher fade rate means shorter trails/faster fade-out.
+    fadeToBlackBy(leds, NUM_LEDS, CONFETTI_FADE_RATE);
+
+    // Step 2: Randomly add a new sparkle
+    if (random8() < CONFETTI_SPARKLE_PROBABILITY) {
+        int pos = random8(NUM_LEDS); // Pick a random LED index
+
+        // Pick a random *bright* color. Using CHSV is easy for this.
+        // random8() gives a value 0-255.
+        CRGB sparkleColor = CHSV(random8(),        // Random Hue
+                                 200,             // Saturation (0-255), 200 is vibrant but not maxed out
+                                 255);            // Value/Brightness (Max)
+
+        // Set the LED at the random position to the new sparkle color.
+        // Using '=' replaces any existing color. Using '+=' adds colors (can get bright).
+        leds[pos] = sparkleColor;
+    }
+
+    // Step 3: Show the updated LEDs
+    FastLED.show();
+
+    // Step 4: Delay slightly for animation speed control
+    // Using FastLED's non-blocking delay is good practice within FastLED loops
+    FastLED.delay(CONFETTI_DELAY);
+}
+
+/* Helper function to print RGB values */
+void printRGB(CRGB color) {
+  Serial.print("(");
+  Serial.print(color.r); Serial.print(", ");
+  Serial.print(color.g); Serial.print(", ");
+  Serial.print(color.b); Serial.print(")");
+}
